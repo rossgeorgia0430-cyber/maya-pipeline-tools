@@ -1,0 +1,30 @@
+# Build outputs
+build/
+build_local/
+build2026/
+
+# Qt headers extracted from Maya SDK (too large, not part of source)
+qt_include/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.db
+
+# Compiled binaries
+*.mll
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
