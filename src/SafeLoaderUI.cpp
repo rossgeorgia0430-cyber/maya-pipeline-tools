@@ -1,5 +1,6 @@
 #include "SafeLoaderUI.h"
 #include "PluginLog.h"
+#include "SceneScanner.h"
 
 #include <maya/MGlobal.h>
 #include <maya/MQtUtil.h>
@@ -8,6 +9,7 @@
 
 #include <QFileInfo>
 #include <QByteArray>
+#include <QStringList>
 
 #include <sstream>
 
@@ -54,6 +56,12 @@ static QString utf8ToQString(const std::string& s) {
 static std::string qStringToUtf8(const QString& s) {
     QByteArray u8 = s.toUtf8();
     return std::string(u8.constData(), static_cast<size_t>(u8.size()));
+}
+
+static QFileInfo resolvedFileInfo(const std::string& rawPath)
+{
+    const std::string resolved = SceneScanner::resolveSceneRelative(rawPath);
+    return QFileInfo(utf8ToQString(resolved.empty() ? rawPath : resolved));
 }
 
 // ============================================================================
@@ -216,6 +224,7 @@ void SafeLoaderUI::scanReferences()
     for (unsigned int i = 0; i < refFiles.length(); ++i) {
         RefEntry entry;
         entry.filePath = toUtf8(refFiles[i]);
+        entry.resolvedPath = SceneScanner::resolveSceneRelative(entry.filePath);
 
         // Get reference node name
         MString refNodeResult;
@@ -232,8 +241,11 @@ void SafeLoaderUI::scanReferences()
         MGlobal::executeCommand(loadCmd, loaded);
         entry.isLoaded = (loaded != 0);
 
-        // Check file existence and size
-        QFileInfo fi(utf8ToQString(entry.filePath));
+        // Check file existence and size using the resolved on-disk path.
+        // Maya may return unresolved paths with env-vars, scene-relative
+        // segments, or reference copy-number suffixes such as {1}. Using the
+        // raw string here can incorrectly mark valid references as missing.
+        QFileInfo fi = resolvedFileInfo(entry.filePath);
         entry.fileExists = fi.exists();
         entry.fileSize = fi.exists() ? fi.size() : 0;
 
@@ -327,7 +339,12 @@ void SafeLoaderUI::refreshTable()
         }
         QString path = utf8ToQString(ref.filePath);
         pathItem->setText(path);
-        pathItem->setToolTip(path);
+        QStringList tooltipLines;
+        tooltipLines << path;
+        if (!ref.resolvedPath.empty() && ref.resolvedPath != ref.filePath) {
+            tooltipLines << (QString("Resolved: ") + utf8ToQString(ref.resolvedPath));
+        }
+        pathItem->setToolTip(tooltipLines.join("\n"));
     }
 
     tableWidget_->blockSignals(false);
@@ -359,6 +376,7 @@ void SafeLoaderUI::onLoadSelected()
 {
     int loaded = 0;
     int failed = 0;
+    int skippedMissing = 0;
 
     for (int row = 0; row < tableWidget_->rowCount(); ++row) {
         QTableWidgetItem* checkItem = tableWidget_->item(row, 0);
@@ -368,6 +386,11 @@ void SafeLoaderUI::onLoadSelected()
         RefEntry& ref = refs_[row];
         if (ref.isLoaded) continue;
         if (ref.refNode.empty()) continue;
+        if (!ref.fileExists) {
+            ++skippedMissing;
+            PluginLog::warn("SafeLoader", "Skip missing ref: " + ref.filePath);
+            continue;
+        }
 
         std::ostringstream logMsg;
         logMsg << "Loading: " << ref.filePath;
@@ -388,8 +411,10 @@ void SafeLoaderUI::onLoadSelected()
 
     refreshTable();
 
-    QString msg = QString("Loaded: %1, Failed: %2").arg(loaded).arg(failed);
+    QString msg = QString("Loaded: %1, Failed: %2, Skipped Missing: %3")
+        .arg(loaded).arg(failed).arg(skippedMissing);
     PluginLog::info("SafeLoader", qStringToUtf8(msg));
+    QMessageBox::information(this, "Load Selected", msg);
 }
 
 // ============================================================================
@@ -400,11 +425,13 @@ void SafeLoaderUI::onLoadAll()
 {
     int loaded = 0;
     int failed = 0;
+    int skippedMissing = 0;
     int total = 0;
 
     for (auto& ref : refs_) {
         if (ref.isLoaded) continue;
         if (ref.refNode.empty()) continue;
+        if (!ref.fileExists) continue;
         ++total;
     }
 
@@ -417,6 +444,11 @@ void SafeLoaderUI::onLoadAll()
     for (auto& ref : refs_) {
         if (ref.isLoaded) continue;
         if (ref.refNode.empty()) continue;
+        if (!ref.fileExists) {
+            ++skippedMissing;
+            PluginLog::warn("SafeLoader", "Skip missing ref: " + ref.filePath);
+            continue;
+        }
         ++current;
 
         std::ostringstream logMsg;
@@ -439,8 +471,8 @@ void SafeLoaderUI::onLoadAll()
 
     refreshTable();
 
-    QString msg = QString("Load All complete.\nLoaded: %1\nFailed: %2")
-        .arg(loaded).arg(failed);
+    QString msg = QString("Load All complete.\nLoaded: %1\nFailed: %2\nSkipped Missing: %3")
+        .arg(loaded).arg(failed).arg(skippedMissing);
     QMessageBox::information(this, "Load All", msg);
 }
 

@@ -74,6 +74,13 @@ A **Pipeline Tools** menu will appear in Maya's main menu bar.
 - [User Guide](docs/user-guide.md) — installation, UI walkthrough, workflows
 - [Developer Guide](docs/developer-guide.md) — architecture, module details, build system, extension guide
 
+## 维护说明
+
+- 插件入口在 `src/pluginMain.cpp`，命令注册或菜单异常时优先检查这里。
+- 路径解析统一依赖 `src/SceneScanner.cpp`；新增与引用/依赖路径相关的逻辑时，优先复用现有解析函数，避免相对路径、环境变量或 `{1}` 副本后缀被误判。
+- `Safe Loader` 现在按“解析后的真实磁盘路径”判断文件存在性；不要回退到直接使用 Maya 原始返回路径做存在性判断。
+- 插件初始化失败需要回滚已注册命令；后续扩展 `pluginMain` 时请保持当前回滚策略，避免 Maya 中残留半注册状态。
+- 提交前建议至少重新编译一次目标 Maya 版本；本次修复已在本机 `build_local` 的 Release 配置下通过编译。
 ## License
 
 MIT

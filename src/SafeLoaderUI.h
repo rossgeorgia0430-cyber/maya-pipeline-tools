@@ -18,6 +18,7 @@
 struct RefEntry {
     std::string refNode;
     std::string filePath;
+    std::string resolvedPath;
     bool isLoaded;
     bool fileExists;
     qint64 fileSize;

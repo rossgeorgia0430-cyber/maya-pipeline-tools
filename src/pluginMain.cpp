@@ -1,4 +1,4 @@
-#include <maya/MFnPlugin.h>
+﻿#include <maya/MFnPlugin.h>
 #include <maya/MGlobal.h>
 #include <maya/MObject.h>
 #include <maya/MStatus.h>
@@ -33,22 +33,18 @@ static MString utf8ToMString(const std::string& utf8) {
 
 static const char* kMenuName = "RefCheckerPluginMenu";
 
-static void createMenu()
+static MStatus createMenu()
 {
-    // Create a top-level menu on Maya's main menu bar.
-    // Build as std::string and convert via utf8ToMString so that Chinese
-    // annotation text is preserved on non-UTF-8 Windows (ACP=936/GBK).
-    // The source file MUST be saved as UTF-8 (with or without BOM).
     std::string mel;
     mel += "if (`menu -exists " + std::string(kMenuName) + "`) deleteUI " + kMenuName + ";\n";
     mel += "global string $gMainWindow;\n";
     mel += "menu -parent $gMainWindow -tearOff true -label \"Pipeline Tools\" " + std::string(kMenuName) + ";\n";
-    mel += u8"menuItem -label \"Open Without References\" -command \"safeOpenScene\" -annotation \"打开场景文件但不加载任何引用，避免因缺失引用导致卡死\";\n";
-    mel += u8"menuItem -label \"Reference Checker\" -command \"refChecker\" -annotation \"扫描场景中所有依赖文件（引用、贴图、缓存、音频），检查缺失并批量修复路径\";\n";
-    mel += u8"menuItem -label \"Safe Load References\" -command \"safeLoadRefs\" -annotation \"逐个查看和加载/卸载场景中的引用，可移除找不到文件的引用\";\n";
+    mel += "menuItem -label \"Open Without References\" -command \"safeOpenScene\" -annotation \"Open a scene without loading references.\";\n";
+    mel += "menuItem -label \"Reference Checker\" -command \"refChecker\" -annotation \"Scan dependencies and repair broken paths.\";\n";
+    mel += "menuItem -label \"Safe Load References\" -command \"safeLoadRefs\" -annotation \"Inspect, load, unload, or remove scene references safely.\";\n";
     mel += "menuItem -divider true;\n";
-    mel += u8"menuItem -label \"Batch Animation Exporter\" -command \"batchAnimExporter\" -annotation \"批量导出场景中的相机、骨骼动画和 BlendShape 为 FBX 文件\";\n";
-    MGlobal::executeCommand(utf8ToMString(mel));
+    mel += "menuItem -label \"Batch Animation Exporter\" -command \"batchAnimExporter\" -annotation \"Bake and export camera, skeleton, and blendshape animation to FBX.\";\n";
+    return MGlobal::executeCommand(utf8ToMString(mel));
 }
 
 static void deleteMenu()
@@ -65,7 +61,16 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
     MFnPlugin plugin(obj, "RefCheckerPlugin", "1.1.0", "Any", &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
 
-    // Register refChecker command
+    PluginLog::init();
+
+    auto rollbackRegistrations = [&plugin]() {
+        deleteMenu();
+        plugin.deregisterCommand(SafeLoaderCmd::kCommandName);
+        plugin.deregisterCommand(SafeOpenCmd::kCommandName);
+        plugin.deregisterCommand(BatchExporterCmd::kCommandName);
+        plugin.deregisterCommand(RefCheckerCmd::kCommandName);
+    };
+
     status = plugin.registerCommand(
         RefCheckerCmd::kCommandName,
         RefCheckerCmd::creator,
@@ -73,10 +78,10 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
     );
     if (!status) {
         PluginLog::error("Plugin", "Failed to register command: refChecker");
+        PluginLog::shutdown();
         return status;
     }
 
-    // Register batchAnimExporter command
     status = plugin.registerCommand(
         BatchExporterCmd::kCommandName,
         BatchExporterCmd::creator,
@@ -84,10 +89,11 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
     );
     if (!status) {
         PluginLog::error("Plugin", "Failed to register command: batchAnimExporter");
+        rollbackRegistrations();
+        PluginLog::shutdown();
         return status;
     }
 
-    // Register safeOpenScene command
     status = plugin.registerCommand(
         SafeOpenCmd::kCommandName,
         SafeOpenCmd::creator,
@@ -95,10 +101,11 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
     );
     if (!status) {
         PluginLog::error("Plugin", "Failed to register command: safeOpenScene");
+        rollbackRegistrations();
+        PluginLog::shutdown();
         return status;
     }
 
-    // Register safeLoadRefs command
     status = plugin.registerCommand(
         SafeLoaderCmd::kCommandName,
         SafeLoaderCmd::creator,
@@ -106,13 +113,19 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
     );
     if (!status) {
         PluginLog::error("Plugin", "Failed to register command: safeLoadRefs");
+        rollbackRegistrations();
+        PluginLog::shutdown();
         return status;
     }
 
-    // Create menu
-    createMenu();
+    status = createMenu();
+    if (!status) {
+        PluginLog::error("Plugin", "Failed to create Pipeline Tools menu.");
+        rollbackRegistrations();
+        PluginLog::shutdown();
+        return status;
+    }
 
-    PluginLog::init();
     PluginLog::logEnvironment();
     PluginLog::info("Plugin", "PipelineTools v1.1.0 loaded successfully.");
     PluginLog::info("Plugin", std::string("Build: ") + __DATE__ + " " + __TIME__);
@@ -121,42 +134,36 @@ __declspec(dllexport) MStatus initializePlugin(MObject obj)
 
 __declspec(dllexport) MStatus uninitializePlugin(MObject obj)
 {
-    MStatus status;
-
     MFnPlugin plugin(obj);
+    MStatus result = MS::kSuccess;
 
-    // Delete menu
     deleteMenu();
 
-    // Deregister refChecker command
-    status = plugin.deregisterCommand(RefCheckerCmd::kCommandName);
+    MStatus status = plugin.deregisterCommand(RefCheckerCmd::kCommandName);
     if (!status) {
         PluginLog::error("Plugin", "Failed to deregister command: refChecker");
-        return status;
+        result = status;
     }
 
-    // Deregister batchAnimExporter command
     status = plugin.deregisterCommand(BatchExporterCmd::kCommandName);
     if (!status) {
         PluginLog::error("Plugin", "Failed to deregister command: batchAnimExporter");
-        return status;
+        result = status;
     }
 
-    // Deregister safeOpenScene command
     status = plugin.deregisterCommand(SafeOpenCmd::kCommandName);
     if (!status) {
         PluginLog::error("Plugin", "Failed to deregister command: safeOpenScene");
-        return status;
+        result = status;
     }
 
-    // Deregister safeLoadRefs command
     status = plugin.deregisterCommand(SafeLoaderCmd::kCommandName);
     if (!status) {
         PluginLog::error("Plugin", "Failed to deregister command: safeLoadRefs");
-        return status;
+        result = status;
     }
 
     PluginLog::info("Plugin", "PipelineTools v1.1.0 unloaded.");
     PluginLog::shutdown();
-    return MS::kSuccess;
+    return result;
 }
