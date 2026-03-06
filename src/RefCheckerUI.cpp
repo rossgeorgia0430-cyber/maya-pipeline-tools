@@ -211,37 +211,92 @@ static bool updateReferencePathNoLoad(const std::string& refNode,
                                       const std::string& targetPathRaw,
                                       const std::string& targetPathResolved)
 {
-    if (refNode.empty() || targetPathRaw.empty()) return false;
-    // Use loadReferenceDepth='none' to update the reference target path without
-    // forcing a heavy load in this phase.
-    std::string pyCmd =
-        "import maya.cmds as cmds\n"
-        "try:\n"
-        "    cmds.file('" + pyStr(targetPathRaw) + "', loadReference='" + pyStr(refNode)
-        + "', loadReferenceDepth='none')\n"
-        "except RuntimeError:\n"
-        "    pass";
-    execPython(pyCmd);
+    if (refNode.empty()) return false;
 
-    std::string current = queryReferenceUnresolvedPath(refNode);
-    if (current.empty()) return false;
-    const std::string curNorm = normalizePathForCompare(current);
-    if (curNorm == normalizePathForCompare(targetPathRaw)) return true;
+    auto matchesTarget = [&](const std::string& current) -> bool {
+        if (current.empty()) return false;
+        const std::string curNorm = normalizePathForCompare(current);
+        if (!targetPathRaw.empty() && curNorm == normalizePathForCompare(targetPathRaw)) return true;
+        if (!targetPathResolved.empty() && curNorm == normalizePathForCompare(targetPathResolved)) return true;
+        return false;
+    };
+
+    auto tryUpdateTo = [&](const std::string& path) -> bool {
+        if (path.empty()) return false;
+        // Use loadReferenceDepth='none' to update path only, avoiding deep loads here.
+        std::string pyCmd =
+            "import maya.cmds as cmds\n"
+            "try:\n"
+            "    cmds.file('" + pyStr(path) + "', loadReference='" + pyStr(refNode)
+            + "', loadReferenceDepth='none')\n"
+            "except RuntimeError:\n"
+            "    pass";
+        execPython(pyCmd);
+        return matchesTarget(queryReferenceUnresolvedPath(refNode));
+    };
+
+    if (tryUpdateTo(targetPathRaw)) return true;
     if (!targetPathResolved.empty() &&
-        curNorm == normalizePathForCompare(targetPathResolved)) return true;
+        normalizePathForCompare(targetPathResolved) != normalizePathForCompare(targetPathRaw)) {
+        if (tryUpdateTo(targetPathResolved)) return true;
+    }
     return false;
 }
 
-static bool loadReferenceByNode(const std::string& refNode)
+static bool loadReferenceByNode(const std::string& refNode,
+                                const std::string& pathHintRaw = std::string(),
+                                const std::string& pathHintResolved = std::string())
 {
     if (refNode.empty()) return false;
-    std::string pyLoad =
-        "import maya.cmds as cmds\n"
-        "try:\n"
-        "    cmds.file(loadReference='" + pyStr(refNode) + "')\n"
-        "except RuntimeError:\n"
-        "    pass";
-    execPython(pyLoad);
+
+    if (isReferenceLoaded(refNode)) return true;
+
+    auto tryLoadByNode = [&](const char* depth) -> bool {
+        std::string pyCmd = "import maya.cmds as cmds\ntry:\n    ";
+        if (depth && *depth) {
+            pyCmd += "cmds.file(loadReference='" + pyStr(refNode)
+                + "', loadReferenceDepth='" + std::string(depth) + "')\n";
+        } else {
+            pyCmd += "cmds.file(loadReference='" + pyStr(refNode) + "')\n";
+        }
+        pyCmd += "except RuntimeError:\n    pass";
+        execPython(pyCmd);
+        return isReferenceLoaded(refNode);
+    };
+
+    auto tryLoadWithPath = [&](const std::string& path, const char* depth) -> bool {
+        if (path.empty()) return false;
+        std::string pyCmd = "import maya.cmds as cmds\ntry:\n    ";
+        if (depth && *depth) {
+            pyCmd += "cmds.file('" + pyStr(path) + "', loadReference='" + pyStr(refNode)
+                + "', loadReferenceDepth='" + std::string(depth) + "')\n";
+        } else {
+            pyCmd += "cmds.file('" + pyStr(path) + "', loadReference='" + pyStr(refNode) + "')\n";
+        }
+        pyCmd += "except RuntimeError:\n    pass";
+        execPython(pyCmd);
+        return isReferenceLoaded(refNode);
+    };
+
+    // 1) Fast path: regular load, then top-only fallback (helps when nested refs are still broken).
+    if (tryLoadByNode(nullptr)) return true;
+    if (tryLoadByNode("topOnly")) return true;
+
+    // 2) Retry with explicit path hints.
+    std::vector<std::string> hints;
+    if (!pathHintRaw.empty()) hints.push_back(pathHintRaw);
+    if (!pathHintResolved.empty() &&
+        normalizePathForCompare(pathHintResolved) != normalizePathForCompare(pathHintRaw)) {
+        hints.push_back(pathHintResolved);
+    }
+    for (const auto& hint : hints) {
+        if (tryLoadWithPath(hint, nullptr)) return true;
+        if (tryLoadWithPath(hint, "topOnly")) return true;
+    }
+
+    // 3) MEL fallback.
+    MString melCmd = MString("file -loadReference \"") + refNode.c_str() + "\"";
+    MGlobal::executeCommand(melCmd);
     return isReferenceLoaded(refNode);
 }
 
@@ -802,14 +857,15 @@ void RefCheckerUI::onLoadReference(int depIndex)
 
     PluginLog::info("RefChecker", "onLoadReference: loading " + dep.node);
 
-    bool loaded = loadReferenceByNode(dep.node);
+    std::string resolvedDepPath = dep.path.empty() ? std::string() : resolvePathForApply(dep.path);
+    bool loaded = loadReferenceByNode(dep.node, dep.path, resolvedDepPath);
 
     // If simple load failed, try with explicit resolved path
     if (!loaded && !dep.path.empty()) {
         std::string resolved = resolvePathForApply(dep.path);
         PluginLog::info("RefChecker", "onLoadReference: retry with path: " + resolved);
         updateReferencePathNoLoad(dep.node, dep.path, resolved);
-        loaded = loadReferenceByNode(dep.node);
+        loaded = loadReferenceByNode(dep.node, dep.path, resolved);
     }
 
     if (loaded) {
@@ -853,7 +909,8 @@ void RefCheckerUI::onLoadAllUnloaded()
 
         PluginLog::info("RefChecker", "onLoadAllUnloaded: loading " + dep.node);
 
-        bool loaded = loadReferenceByNode(dep.node);
+        std::string resolvedDepPath = dep.path.empty() ? std::string() : resolvePathForApply(dep.path);
+        bool loaded = loadReferenceByNode(dep.node, dep.path, resolvedDepPath);
 
         // Strategy 2: if still unloaded, query filename and load with explicit resolved path
         if (!loaded) {
@@ -866,7 +923,7 @@ void RefCheckerUI::onLoadAllUnloaded()
                 std::string resolved = resolvePathForApply(refPath);
                 PluginLog::info("RefChecker", "onLoadAllUnloaded: retry with path: " + resolved);
                 updateReferencePathNoLoad(dep.node, refPath, resolved);
-                loaded = loadReferenceByNode(dep.node);
+                loaded = loadReferenceByNode(dep.node, refPath, resolved);
             }
         }
 
@@ -875,7 +932,7 @@ void RefCheckerUI::onLoadAllUnloaded()
             std::string resolved = resolvePathForApply(dep.path);
             PluginLog::info("RefChecker", "onLoadAllUnloaded: retry with dep.path: " + resolved);
             updateReferencePathNoLoad(dep.node, dep.path, resolved);
-            loaded = loadReferenceByNode(dep.node);
+            loaded = loadReferenceByNode(dep.node, dep.path, resolved);
         }
 
         if (loaded) {
@@ -2217,7 +2274,16 @@ bool RefCheckerUI::applyPath(DependencyInfo& dep, const std::string& newPath)
 
         // Try loading after path update.
         PluginLog::info("RefChecker", "ApplyFix: Phase2 loading reference: " + node);
-        bool loaded = loadReferenceByNode(node);
+        bool loaded = loadReferenceByNode(node, mayaPath, resolvedPath);
+
+        // Some direct-open scenes keep stale reference state after a failed load.
+        // In that case, force a second path update using absolute path and retry.
+        if (!loaded && !resolvedPath.empty() &&
+            normalizePathForCompare(resolvedPath) != normalizePathForCompare(mayaPath)) {
+            bool absUpdated = updateReferencePathNoLoad(node, resolvedPath, resolvedPath);
+            pathUpdated = pathUpdated || absUpdated;
+            loaded = loadReferenceByNode(node, resolvedPath, resolvedPath);
+        }
 
         if (loaded) {
             PluginLog::info("RefChecker", "ApplyFix: reference loaded OK: " + node);
@@ -2227,9 +2293,8 @@ bool RefCheckerUI::applyPath(DependencyInfo& dep, const std::string& newPath)
             dep.isLoaded = false;
         }
 
-        // Return true if we successfully updated the stored path (or loaded it).
-        // dep.isLoaded indicates the actual load state.
-        return pathUpdated;
+        // Treat a successful load as success even if path comparison query failed.
+        return pathUpdated || loaded;
 
     } else if (depType == "texture") {
         MString nodeTypeResult;

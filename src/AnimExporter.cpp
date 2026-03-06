@@ -25,6 +25,7 @@ static void ensureDir(const std::string& path);
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
@@ -969,6 +970,15 @@ static bool isReferencedNode(const MObject& obj) {
     return fn.isFromReferencedFile();
 }
 
+static bool isReferencedPath(const std::string& path) {
+    if (path.empty()) return false;
+    MSelectionList sel;
+    if (sel.add(MString(path.c_str())) != MS::kSuccess) return false;
+    MObject obj;
+    if (sel.getDependNode(0, obj) != MS::kSuccess) return false;
+    return isReferencedNode(obj);
+}
+
 static void unlockTransformChannels(const std::vector<std::string>& nodes) {
     if (nodes.empty()) return;
 
@@ -1257,7 +1267,7 @@ static ExportResult exportSkeletonFbxViaDuplicate(const std::string& srcRootJoin
 
             for (const auto& wi : work) {
                 if (!wi.needsRename) continue;
-                std::string target = ":" + wi.desiredBare; // move to root namespace
+                std::string target = wi.desiredBare;
                 melQueryString("rename \"" + wi.fullPath + "\" \"" + target + "\"");
             }
 
@@ -2210,7 +2220,7 @@ ExportResult exportSkeletonFbx(const std::string& skeletonRoot,
 
                 for (const auto& wi : work) {
                     if (!wi.needsRename) continue;
-                    std::string target = ":" + wi.desiredBare; // force root namespace
+                    std::string target = wi.desiredBare;
                     std::string cmd = "rename \"" + wi.fullPath + "\" \"" + target + "\"";
                     melQueryString(cmd);
                 }
@@ -2662,6 +2672,16 @@ ExportResult exportBlendShapeFbx(const std::string& meshNode,
                           return a < b;
                       });
 
+            const bool hasReferencedSkeletonNode = [&]() -> bool {
+                for (const auto& jp : bsSkelJoints) {
+                    if (isReferencedPath(jp)) return true;
+                }
+                for (const auto& tp : bsSkelTransforms) {
+                    if (isReferencedPath(tp)) return true;
+                }
+                return false;
+            }();
+
             {
                 std::ostringstream dbg;
                 dbg << "exportBlendShapeFbx: namespacesToMerge=[";
@@ -2671,6 +2691,11 @@ ExportResult exportBlendShapeFbx(const std::string& meshNode,
                 }
                 dbg << "] (deepest first)";
                 debugInfo(dbg.str());
+            }
+
+            if (hasReferencedSkeletonNode && !sortedNamespaces.empty()) {
+                debugInfo("exportBlendShapeFbx: skeleton contains referenced nodes, "
+                          "skip namespace merge on source scene");
             }
 
             // Merge namespaces inside an undo chunk so we can revert after export.
@@ -2684,6 +2709,7 @@ ExportResult exportBlendShapeFbx(const std::string& meshNode,
             int nsSkippedNotExist = 0;
             std::vector<std::string> failedNamespaces;
 
+            if (!hasReferencedSkeletonNode) {
                 for (const auto& ns : sortedNamespaces) {
                     int nsExists = 0;
                     MGlobal::executeCommand(
@@ -2711,6 +2737,7 @@ ExportResult exportBlendShapeFbx(const std::string& meshNode,
                     debugWarn("exportBlendShapeFbx: namespace '" + ns + "' merge FAILED "
                               "(may contain referenced nodes or name conflicts)");
                 }
+            }
             }
 
             {
@@ -3215,127 +3242,130 @@ ExportResult exportSkeletonBlendShapeFbx(
     }
 
     // --- Namespace stripping via per-node rename (same strategy as exportSkeletonFbx) ---
-    // The previous "merge outermost namespace" approach fails for nested namespaces
-    // (e.g. ShotNS:RigNS:Joint). Instead, rename each joint/mesh to its bare name
-    // using the proven rename-deepest-first strategy, then restore via MObject handles.
+    // Referenced source nodes are read-only in Maya. For referenced rigs we skip in-place
+    // renaming to avoid thousands of warnings; FBX export still applies the requested range.
+    const bool canRenameSourceNodes = !rootReferenced;
     bool hadNamespaceOnBones = false;
-
-    // Build MObject records for joints
-    {
-        MSelectionList jSel;
-        for (const auto& j : allJoints) {
-            jSel.add(MString(j.c_str()));
-        }
-        jointRenameRecs.reserve(allJoints.size());
-        for (unsigned int i = 0; i < jSel.length() && i < allJoints.size(); ++i) {
-            MObject obj;
-            jSel.getDependNode(i, obj);
-            MFnDependencyNode fn(obj);
-            NodeRec rec;
-            rec.obj = obj;
-            rec.originalName = toUtf8(fn.name());
-            jointRenameRecs.push_back(rec);
-        }
-    }
-
-    // Build MObject records for skinned mesh transforms
-    {
-        MSelectionList mSel;
-        for (const auto& m : skinnedMeshTransforms) {
-            mSel.add(MString(m.c_str()));
-        }
-        meshRenameRecs.reserve(skinnedMeshTransforms.size());
-        for (unsigned int i = 0; i < mSel.length() && i < skinnedMeshTransforms.size(); ++i) {
-            MObject obj;
-            mSel.getDependNode(i, obj);
-            MFnDependencyNode fn(obj);
-            NodeRec rec;
-            rec.obj = obj;
-            rec.originalName = toUtf8(fn.name());
-            meshRenameRecs.push_back(rec);
-        }
-    }
-
-    // Rename joints: strip namespaces + normalize root bone
-    {
-        struct WorkItem {
-            std::string fullPath;
-            int depth;
-            bool isRoot;
-            std::string leaf;
-            std::string desiredBare;
-            bool needsRename;
-        };
-        std::vector<WorkItem> work;
-        work.reserve(allJoints.size());
-
-        for (const auto& p : allJoints) {
-            WorkItem wi;
-            wi.fullPath = p;
-            wi.depth = dagDepth(p);
-            wi.isRoot = (p == rootJoint);
-            wi.leaf = dagLeafName(p);
-
-            std::string bare = stripAllNamespaces(wi.leaf);
-            if (wi.isRoot) {
-                bare = normalizeRootBoneName(bare);
+    if (!canRenameSourceNodes) {
+        debugInfo("exportSkeletonBlendShapeFbx: root is referenced, skip in-scene namespace rename");
+    } else {
+        // Build MObject records for joints
+        {
+            MSelectionList jSel;
+            for (const auto& j : allJoints) {
+                jSel.add(MString(j.c_str()));
             }
-            wi.desiredBare = bare;
-
-            bool hasNs = (wi.leaf.find(':') != std::string::npos);
-            bool rootNeedsNorm = false;
-            if (wi.isRoot) {
-                std::string bare0 = stripAllNamespaces(wi.leaf);
-                rootNeedsNorm = (normalizeRootBoneName(bare0) != bare0);
+            jointRenameRecs.reserve(allJoints.size());
+            for (unsigned int i = 0; i < jSel.length() && i < allJoints.size(); ++i) {
+                MObject obj;
+                jSel.getDependNode(i, obj);
+                MFnDependencyNode fn(obj);
+                NodeRec rec;
+                rec.obj = obj;
+                rec.originalName = toUtf8(fn.name());
+                jointRenameRecs.push_back(rec);
             }
-            wi.needsRename = hasNs || rootNeedsNorm;
-            if (hasNs) hadNamespaceOnBones = true;
-            if (wi.needsRename) didRenameJoints = true;
-            work.push_back(wi);
         }
 
-        if (didRenameJoints) {
-            // Rename deepest first so parent renames don't invalidate child paths
-            std::sort(work.begin(), work.end(),
-                      [](const WorkItem& a, const WorkItem& b) {
-                          return a.depth > b.depth;
-                      });
+        // Build MObject records for skinned mesh transforms
+        {
+            MSelectionList mSel;
+            for (const auto& m : skinnedMeshTransforms) {
+                mSel.add(MString(m.c_str()));
+            }
+            meshRenameRecs.reserve(skinnedMeshTransforms.size());
+            for (unsigned int i = 0; i < mSel.length() && i < skinnedMeshTransforms.size(); ++i) {
+                MObject obj;
+                mSel.getDependNode(i, obj);
+                MFnDependencyNode fn(obj);
+                NodeRec rec;
+                rec.obj = obj;
+                rec.originalName = toUtf8(fn.name());
+                meshRenameRecs.push_back(rec);
+            }
+        }
 
-            int renameOk = 0, renameFail = 0;
-            for (const auto& wi : work) {
-                if (!wi.needsRename) continue;
-                std::string target = ":" + wi.desiredBare;
-                std::string cmd = "rename \"" + wi.fullPath + "\" \"" + target + "\"";
-                std::string result = melQueryString(cmd);
-                if (!result.empty()) {
-                    ++renameOk;
-                } else {
-                    ++renameFail;
+        // Rename joints: strip namespaces + normalize root bone
+        {
+            struct WorkItem {
+                std::string fullPath;
+                int depth;
+                bool isRoot;
+                std::string leaf;
+                std::string desiredBare;
+                bool needsRename;
+            };
+            std::vector<WorkItem> work;
+            work.reserve(allJoints.size());
+
+            for (const auto& p : allJoints) {
+                WorkItem wi;
+                wi.fullPath = p;
+                wi.depth = dagDepth(p);
+                wi.isRoot = (p == rootJoint);
+                wi.leaf = dagLeafName(p);
+
+                std::string bare = stripAllNamespaces(wi.leaf);
+                if (wi.isRoot) {
+                    bare = normalizeRootBoneName(bare);
+                }
+                wi.desiredBare = bare;
+
+                bool hasNs = (wi.leaf.find(':') != std::string::npos);
+                bool rootNeedsNorm = false;
+                if (wi.isRoot) {
+                    std::string bare0 = stripAllNamespaces(wi.leaf);
+                    rootNeedsNorm = (normalizeRootBoneName(bare0) != bare0);
+                }
+                wi.needsRename = hasNs || rootNeedsNorm;
+                if (hasNs) hadNamespaceOnBones = true;
+                if (wi.needsRename) didRenameJoints = true;
+                work.push_back(wi);
+            }
+
+            if (didRenameJoints) {
+                // Rename deepest first so parent renames don't invalidate child paths
+                std::sort(work.begin(), work.end(),
+                          [](const WorkItem& a, const WorkItem& b) {
+                              return a.depth > b.depth;
+                          });
+
+                int renameOk = 0, renameFail = 0;
+                for (const auto& wi : work) {
+                    if (!wi.needsRename) continue;
+                    std::string target = wi.desiredBare;
+                    std::string cmd = "rename \"" + wi.fullPath + "\" \"" + target + "\"";
+                    std::string result = melQueryString(cmd);
+                    if (!result.empty()) {
+                        ++renameOk;
+                    } else {
+                        ++renameFail;
+                    }
+                }
+
+                debugInfo("exportSkeletonBlendShapeFbx: jointRename{ok=" + std::to_string(renameOk)
+                          + ", fail=" + std::to_string(renameFail) + "}");
+
+                if (renameFail > 0) {
+                    warnings.push_back("Failed to rename " + std::to_string(renameFail)
+                                       + " joint(s) — exported bone names may contain namespace prefixes");
+                }
+
+                // Update rootJoint path after rename
+                if (!rootObj.isNull()) {
+                    MFnDagNode fn(rootObj);
+                    rootJoint = toUtf8(fn.fullPathName());
                 }
             }
-
-            debugInfo("exportSkeletonBlendShapeFbx: jointRename{ok=" + std::to_string(renameOk)
-                      + ", fail=" + std::to_string(renameFail) + "}");
-
-            if (renameFail > 0) {
-                warnings.push_back("Failed to rename " + std::to_string(renameFail)
-                                   + " joint(s) — exported bone names may contain namespace prefixes");
-            }
-
-            // Update rootJoint path after rename
-            if (!rootObj.isNull()) {
-                MFnDagNode fn(rootObj);
-                rootJoint = toUtf8(fn.fullPathName());
-            }
         }
     }
 
-    // Re-query joints after rename
+    // Re-query joints after possible rename
     allJoints = melQueryStringArray(
         "listRelatives -allDescendents -type \"joint\" -fullPath \"" + rootJoint + "\"");
     allJoints.push_back(rootJoint);
 
-    // Safety check: verify no namespace prefixes remain on joints
+    // Safety check: verify namespace cleanup result when rename path is enabled
     {
         int namespacedCount = 0;
         for (const auto& j : allJoints) {
@@ -3347,14 +3377,15 @@ ExportResult exportSkeletonBlendShapeFbx(
         }
         debugInfo("exportSkeletonBlendShapeFbx: allJointsForExport=" + std::to_string(allJoints.size())
                   + ", namespacedAfterCleanup=" + std::to_string(namespacedCount)
-                  + ", didRename=" + std::string(didRenameJoints ? "true" : "false"));
-        if (namespacedCount > 0) {
+                  + ", didRename=" + std::string(didRenameJoints ? "true" : "false")
+                  + ", canRenameSourceNodes=" + std::string(canRenameSourceNodes ? "true" : "false"));
+        if (canRenameSourceNodes && namespacedCount > 0) {
             warnings.push_back(std::to_string(namespacedCount)
                                + " joint(s) still have namespace prefixes after rename");
         }
     }
 
-    // Rename skinned mesh transforms to strip namespaces
+    // Re-collect skinned mesh transforms (paths can change after joint rename)
     {
         skinnedMeshTransforms =
             collectSkinnedMeshTransformsForJoints(allJoints, nullptr, nullptr);
@@ -3398,15 +3429,17 @@ ExportResult exportSkeletonBlendShapeFbx(
             }
         }
 
-        // Rename mesh transforms that still have namespaces
-        for (auto& m : skinnedMeshTransforms) {
-            std::string leaf = dagLeafName(m);
-            if (leaf.find(':') != std::string::npos) {
-                std::string bare = stripAllNamespaces(leaf);
-                std::string cmd = "rename \"" + m + "\" \":" + bare + "\"";
-                std::string result = melQueryString(cmd);
-                if (!result.empty()) {
-                    didRenameMeshes = true;
+        // Rename mesh transforms that still have namespaces (only for writable local rigs)
+        if (canRenameSourceNodes) {
+            for (auto& m : skinnedMeshTransforms) {
+                std::string leaf = dagLeafName(m);
+                if (leaf.find(':') != std::string::npos) {
+                    std::string bare = stripAllNamespaces(leaf);
+                    std::string cmd = "rename \"" + m + "\" \"" + bare + "\"";
+                    std::string result = melQueryString(cmd);
+                    if (!result.empty()) {
+                        didRenameMeshes = true;
+                    }
                 }
             }
         }
@@ -3638,6 +3671,31 @@ static double findKey(const std::string& target, const std::string& which) {
     return val;
 }
 
+// Resolve query sampling range:
+// 1) Use current Maya playbackOptions timeline.
+// 2) If export-range env hints exist, prefer them for log consistency.
+static std::pair<int, int> resolveQuerySampleRange() {
+    double playMin = 0.0;
+    double playMax = 0.0;
+    MGlobal::executeCommand("playbackOptions -q -minTime", playMin);
+    MGlobal::executeCommand("playbackOptions -q -maxTime", playMax);
+    if (playMax < playMin) std::swap(playMin, playMax);
+
+    int sampleStart = static_cast<int>(playMin);
+    int sampleEnd = static_cast<int>(playMax);
+
+    const char* envStart = std::getenv("MAYA_REF_EXPORT_RANGE_START");
+    const char* envEnd = std::getenv("MAYA_REF_EXPORT_RANGE_END");
+    if (envStart && envEnd) {
+        int exportStart = std::atoi(envStart);
+        int exportEnd = std::atoi(envEnd);
+        if (exportEnd < exportStart) std::swap(exportStart, exportEnd);
+        sampleStart = exportStart;
+        sampleEnd = exportEnd;
+    }
+    return std::make_pair(sampleStart, sampleEnd);
+}
+
 FrameRangeInfo queryFrameRange(const ExportItem& item) {
     FrameRangeInfo info;
     info.name     = item.name;
@@ -3646,21 +3704,110 @@ FrameRangeInfo queryFrameRange(const ExportItem& item) {
     info.firstKey = 0.0;
     info.lastKey  = 0.0;
     info.valid    = false;
+    info.inferredFromRange = false;
 
     if (!nodeExists(item.node)) return info;
+
+    const std::pair<int, int> sampleRange = resolveQuerySampleRange();
+    const double queryMin = static_cast<double>(sampleRange.first);
+    const double queryMax = static_cast<double>(sampleRange.second);
+    const bool hasExportRangeHint =
+        (std::getenv("MAYA_REF_EXPORT_RANGE_START") != nullptr) &&
+        (std::getenv("MAYA_REF_EXPORT_RANGE_END") != nullptr);
 
     double globalMin =  1e18;
     double globalMax = -1e18;
     bool found = false;
 
     if (item.type == "camera") {
-        // Camera: query the transform node directly
+        // Camera: query transform + shape (focalLength and common shape attrs).
+        std::vector<std::string> camShapes = melQueryStringArray(
+            "listRelatives -shapes -type \"camera\" -fullPath \"" + item.node + "\"");
+
         if (hasKeys(item.node)) {
             double first = findKey(item.node, "first");
             double last  = findKey(item.node, "last");
             if (first <= last) {
                 globalMin = (std::min)(globalMin, first);
                 globalMax = (std::max)(globalMax, last);
+                found = true;
+            }
+        }
+
+        if (!camShapes.empty()) {
+            const std::string& camShape = camShapes[0];
+            if (hasKeys(camShape)) {
+                double first = findKey(camShape, "first");
+                double last  = findKey(camShape, "last");
+                if (first <= last) {
+                    globalMin = (std::min)(globalMin, first);
+                    globalMax = (std::max)(globalMax, last);
+                    found = true;
+                }
+            }
+
+            const char* shapeAttrs[] = {
+                "focalLength",
+                "horizontalFilmOffset", "verticalFilmOffset",
+                "focusDistance", "fStop", "zoom"
+            };
+            for (const char* attr : shapeAttrs) {
+                std::string plug = camShape + "." + std::string(attr);
+                if (!hasKeys(plug)) continue;
+                double first = findKey(plug, "first");
+                double last  = findKey(plug, "last");
+                if (first <= last) {
+                    globalMin = (std::min)(globalMin, first);
+                    globalMax = (std::max)(globalMax, last);
+                    found = true;
+                }
+            }
+        }
+
+        // Constraint/expression-driven camera may have no explicit keys.
+        // In that case sample start/end deltas across the export/playback range.
+        if (!found) {
+            int sampleStart = sampleRange.first;
+            int sampleEnd = sampleRange.second;
+
+            const char* attrs[] = {"tx", "ty", "tz", "rx", "ry", "rz"};
+            double transformDelta = 0.0;
+            int okAttrs = 0;
+            for (const char* attr : attrs) {
+                double v0 = 0.0;
+                double v1 = 0.0;
+                if (!queryAttrAtTime(item.node, attr, sampleStart, v0)) continue;
+                if (!queryAttrAtTime(item.node, attr, sampleEnd, v1)) continue;
+                transformDelta += std::abs(v1 - v0);
+                ++okAttrs;
+            }
+
+            double flDelta = 0.0;
+            bool flSampled = false;
+            if (!camShapes.empty()) {
+                double fl0 = 0.0;
+                double fl1 = 0.0;
+                if (queryAttrAtTime(camShapes[0], "focalLength", sampleStart, fl0) &&
+                    queryAttrAtTime(camShapes[0], "focalLength", sampleEnd, fl1)) {
+                    flDelta = std::abs(fl1 - fl0);
+                    flSampled = true;
+                }
+            }
+
+            const double totalDelta = transformDelta + flDelta;
+            {
+                std::ostringstream dbg;
+                dbg << "queryFrameRange(camera): node=" << item.node
+                    << ", playbackRange=" << sampleStart << "-" << sampleEnd
+                    << ", sampledAttrs=" << okAttrs
+                    << ", transformDelta=" << transformDelta
+                    << ", focalLengthDelta=" << flDelta;
+                debugInfo(dbg.str());
+            }
+
+            if ((okAttrs > 0 || flSampled) && totalDelta > 1e-4) {
+                globalMin = sampleStart;
+                globalMax = sampleEnd;
                 found = true;
             }
         }
@@ -3706,27 +3853,8 @@ FrameRangeInfo queryFrameRange(const ExportItem& item) {
         }
 
         if (!found && !allJoints.empty()) {
-            double playMin = 0.0;
-            double playMax = 0.0;
-            MGlobal::executeCommand("playbackOptions -q -minTime", playMin);
-            MGlobal::executeCommand("playbackOptions -q -maxTime", playMax);
-            if (playMax < playMin) std::swap(playMin, playMax);
-
-            int sampleStart = static_cast<int>(playMin);
-            int sampleEnd = static_cast<int>(playMax);
-
-            // If export-range env vars are present, use exported range directly
-            // so frame-range log stays consistent with actual FBX output.
-            // (playbackOptions may not cover negative frames that were actually exported.)
-            const char* envStart = std::getenv("MAYA_REF_EXPORT_RANGE_START");
-            const char* envEnd = std::getenv("MAYA_REF_EXPORT_RANGE_END");
-            if (envStart && envEnd) {
-                int exportStart = std::atoi(envStart);
-                int exportEnd = std::atoi(envEnd);
-                if (exportEnd < exportStart) std::swap(exportStart, exportEnd);
-                sampleStart = exportStart;
-                sampleEnd = exportEnd;
-            }
+            int sampleStart = sampleRange.first;
+            int sampleEnd = sampleRange.second;
 
             // Sample up to 24 joints to keep log generation responsive on big rigs.
             size_t maxSamples = 24;
@@ -3795,9 +3923,30 @@ FrameRangeInfo queryFrameRange(const ExportItem& item) {
     }
 
     if (found) {
-        info.firstKey = globalMin;
-        info.lastKey  = globalMax;
+        const double clippedMin = (std::max)(globalMin, queryMin);
+        const double clippedMax = (std::min)(globalMax, queryMax);
+        if (clippedMin <= clippedMax) {
+            info.firstKey = clippedMin;
+            info.lastKey  = clippedMax;
+            info.valid    = true;
+            info.inferredFromRange = false;
+            return info;
+        }
+        found = false;
+    }
+
+    // For exported items with no explicit keys detected in the sample window
+    // (common for constrained/static rigs), keep log output aligned to export range.
+    if (!found && hasExportRangeHint) {
+        info.firstKey = queryMin;
+        info.lastKey  = queryMax;
         info.valid    = true;
+        info.inferredFromRange = true;
+        std::ostringstream dbg;
+        dbg << "queryFrameRange(" << item.type << "): no explicit keys in export window, "
+            << "fallbackToExportRange=" << static_cast<int>(queryMin) << "-" << static_cast<int>(queryMax)
+            << ", node=" << item.node;
+        debugInfo(dbg.str());
     }
     return info;
 }
@@ -3814,8 +3963,6 @@ std::string writeFrameRangeLog(const std::string& outputDir,
 #else
     localtime_r(&now, &tmBuf);
 #endif
-    char timeFmt[64];
-    std::strftime(timeFmt, sizeof(timeFmt), "%Y%m%d_%H%M%S", &tmBuf);
     char dateDisplay[64];
     std::strftime(dateDisplay, sizeof(dateDisplay), "%Y-%m-%d %H:%M:%S", &tmBuf);
 
@@ -3864,21 +4011,44 @@ std::string writeFrameRangeLog(const std::string& outputDir,
     ofs << "==============================\n";
     ofs << u8"\u65f6\u95f4: " << dateDisplay << "\n";
     ofs << u8"\u5bfc\u51fa\u533a\u95f4: \u3010" << userStartFrame << " - " << userEndFrame << u8"\u3011\n";
-    ofs << u8"\u603b\u5e27\u6570: " << (userEndFrame - userStartFrame) << "f\n";
+    ofs << u8"\u603b\u5e27\u6570: " << ((userEndFrame - userStartFrame) + 1) << "f\n";
     ofs << "FPS: " << static_cast<int>(fps) << "\n";
     ofs << "\n";
 
+    size_t validRangeCount = 0;
     for (size_t i = 0; i < ranges.size(); ++i) {
         const FrameRangeInfo& r = ranges[i];
         ofs << "[" << (i + 1) << "] " << typeLabelCn(r.type) << " | ";
         ofs << r.name << " | ";
         ofs << u8"\u6587\u4ef6: " << r.filename << " | ";
+
+        if (r.valid && r.lastKey >= r.firstKey) {
+            int first = static_cast<int>(std::floor(r.firstKey + 0.5));
+            int last = static_cast<int>(std::floor(r.lastKey + 0.5));
+            if (last < first) std::swap(first, last);
+            int frameCount = (last - first) + 1;
+            double seconds = static_cast<double>(frameCount) / fps;
+            std::ostringstream secText;
+            secText << std::fixed << std::setprecision(3) << seconds;
+            ofs << u8"\u5173\u952e\u5e27(\u5bfc\u51fa\u533a\u95f4\u5185): \u3010" << first << " - " << last << u8"\u3011 | ";
+            ofs << u8"\u6301\u7eed: " << frameCount << "f (" << secText.str() << "s)";
+            if (r.inferredFromRange) {
+                ofs << u8" | \u68c0\u6d4b: \u672a\u627e\u5230\u663e\u5f0f\u5173\u952e\u5e27\uff0c\u6309\u5bfc\u51fa\u533a\u95f4\u8bb0\u5f55";
+            }
+            ofs << " | ";
+            ++validRangeCount;
+        } else {
+            ofs << u8"\u5173\u952e\u5e27(\u5bfc\u51fa\u533a\u95f4\u5185): \u3010N/A\u3011 | ";
+            ofs << u8"\u6301\u7eed: N/A | ";
+        }
+
         ofs << u8"\u5bfc\u51fa\u533a\u95f4: \u3010" << userStartFrame << " - " << userEndFrame << u8"\u3011\n";
     }
 
     ofs << "\n";
     ofs << "------------------------------\n";
-    ofs << u8"\u7edf\u8ba1: \u5171 " << ranges.size() << u8" \u9879\n";
+    ofs << u8"\u7edf\u8ba1: \u5171 " << ranges.size() << u8" \u9879"
+        << u8"\uff0c\u5173\u952e\u5e27\u8303\u56f4\u6709\u6548 " << validRangeCount << u8" \u9879\n";
     ofs << "------------------------------\n";
 
     ofs.close();

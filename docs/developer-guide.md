@@ -293,7 +293,7 @@ BlendShape 导出有两个分支，由 `bsIncludeSkeleton` 选项控制：
 **导出流程（onExport）**：
 
 1. 校验输出目录与帧范围
-2. 收集选中项；若包含相机则以首个相机关键帧范围覆盖导出范围
+2. 收集选中项；Timeline 模式严格使用 Maya `playbackOptions`（时间轨道）范围，Custom 模式严格使用用户输入范围
 3. 收集 UI 的 `FbxExportOptions`
 4. Phase 1：调用 `batchBakeAll()` 做批量烘焙
 5. Phase 2：逐项导出 FBX（camera/skeleton/blendshape）

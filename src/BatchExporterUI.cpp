@@ -5,6 +5,7 @@
 
 #include <maya/MGlobal.h>
 #include <maya/MQtUtil.h>
+#include <maya/MAnimControl.h>
 #include <maya/MString.h>
 
 #include <QDir>
@@ -14,6 +15,7 @@
 #include <QByteArray>
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <regex>
 #include <fstream>
@@ -982,31 +984,13 @@ void BatchExporterUI::onExport()
         PluginLog::info("BatchExporter", dbg.str());
     }
 
-    // --- Optional camera-driven range override (Timeline mode only) ---
-    // In Custom mode, user-entered range must be respected exactly.
-    bool rangeOverriddenByCamera = false;
-    std::string rangeCameraNode;
+    // Timeline mode should strictly follow Maya playbackOptions range.
+    // Custom mode should strictly follow user-entered start/end.
     const bool customRangeMode = (radioCustom_ && radioCustom_->isChecked());
-    if (!customRangeMode) {
-        for (const auto& item : selectedItems) {
-            if (item.type == "camera") {
-                FrameRangeInfo camRange = AnimExporter::queryFrameRange(item);
-                if (camRange.valid) {
-                    startFrame = static_cast<int>(camRange.firstKey);
-                    endFrame   = static_cast<int>(camRange.lastKey);
-                    rangeOverriddenByCamera = true;
-                    rangeCameraNode = item.node;
-                }
-                break;
-            }
-        }
-    }
-
     {
         std::ostringstream dbg;
         dbg << "export range resolved: finalRange=" << startFrame << "-" << endFrame
-            << ", overriddenByCamera=" << (rangeOverriddenByCamera ? "true" : "false")
-            << ", cameraNode='" << (rangeCameraNode.empty() ? "<none>" : rangeCameraNode) << "'";
+            << ", source=" << (customRangeMode ? "custom" : "timeline(playbackOptions)");
         PluginLog::info("BatchExporter", dbg.str());
     }
 
@@ -1169,31 +1153,33 @@ void BatchExporterUI::onExport()
         PluginLog::info("BatchExporter", infoMsg);
     }
 
-    // --- Generate export_log at the very beginning of export ---
-    // Filename: "导出区间 {start} - {end}.txt"  (no colon — illegal on Windows)
-    QString exportLogName = QString::fromUtf8(u8"\u5bfc\u51fa\u533a\u95f4 %1 - %2.txt")
-        .arg(startFrame).arg(endFrame);
-    QString exportLogPath = dir.absoluteFilePath(exportLogName);
-    {
-        std::string logPathUtf8 = qStringToUtf8(exportLogPath);
-#ifdef _WIN32
-        std::wstring wLogPath;
+    // --- Generate export_log header at the very beginning of export (optional) ---
+    if (frameRangeLogCheck_ && frameRangeLogCheck_->isChecked()) {
+        // Filename: "导出区间 {start} - {end}.txt"  (no colon — illegal on Windows)
+        QString exportLogName = QString::fromUtf8(u8"\u5bfc\u51fa\u533a\u95f4 %1 - %2.txt")
+            .arg(startFrame).arg(endFrame);
+        QString exportLogPath = dir.absoluteFilePath(exportLogName);
         {
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, logPathUtf8.c_str(), -1, nullptr, 0);
-            if (wlen > 0) {
-                wLogPath.resize(wlen, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, logPathUtf8.c_str(), -1, &wLogPath[0], wlen);
-                if (!wLogPath.empty() && wLogPath.back() == L'\0') wLogPath.pop_back();
+            std::string logPathUtf8 = qStringToUtf8(exportLogPath);
+#ifdef _WIN32
+            std::wstring wLogPath;
+            {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, logPathUtf8.c_str(), -1, nullptr, 0);
+                if (wlen > 0) {
+                    wLogPath.resize(wlen, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, logPathUtf8.c_str(), -1, &wLogPath[0], wlen);
+                    if (!wLogPath.empty() && wLogPath.back() == L'\0') wLogPath.pop_back();
+                }
             }
-        }
-        std::ofstream elog(wLogPath, std::ios::binary);
+            std::ofstream elog(wLogPath, std::ios::binary);
 #else
-        std::ofstream elog(logPathUtf8, std::ios::binary);
+            std::ofstream elog(logPathUtf8, std::ios::binary);
 #endif
-        if (elog.is_open()) {
-            elog << "\xEF\xBB\xBF"; // UTF-8 BOM
-            elog.close();
-            PluginLog::info("BatchExporter", "Export log created: " + logPathUtf8);
+            if (elog.is_open()) {
+                elog << "\xEF\xBB\xBF"; // UTF-8 BOM
+                elog.close();
+                PluginLog::info("BatchExporter", "Export log created: " + logPathUtf8);
+            }
         }
     }
 
@@ -1361,10 +1347,13 @@ void BatchExporterUI::onExport()
         for (size_t i = 0; i < selectedIndices.size(); ++i) {
             size_t idx = selectedIndices[i];
             if (exportItems_[idx].status == "done") {
-                FrameRangeInfo fri;
-                fri.name     = exportItems_[idx].name;
-                fri.type     = exportItems_[idx].type;
-                fri.filename = exportItems_[idx].filename;
+                FrameRangeInfo fri = AnimExporter::queryFrameRange(exportItems_[idx]);
+                if (!fri.valid) {
+                    // Keep row visible in log even when range query fails.
+                    fri.name     = exportItems_[idx].name;
+                    fri.type     = exportItems_[idx].type;
+                    fri.filename = exportItems_[idx].filename;
+                }
                 ranges.push_back(fri);
             }
         }
@@ -1614,22 +1603,58 @@ std::pair<int, int> BatchExporterUI::getFrameRange()
                               customEndSpin_->value());
     }
 
-    // Query Maya timeline range via MEL
-    int startFrame = 1;
-    int endFrame   = 100;
+    auto roundFrame = [](double v) -> int {
+        return static_cast<int>(std::floor(v + (v >= 0.0 ? 0.5 : -0.5)));
+    };
+    auto finitePair = [](double a, double b) -> bool {
+        return std::isfinite(a) && std::isfinite(b);
+    };
 
-    MString startResult;
-    MStatus startStat = MGlobal::executeCommand(
-        "playbackOptions -q -minTime", startResult);
-    if (startStat == MStatus::kSuccess) {
-        startFrame = startResult.asInt();
+    // Prefer Maya API for playback range; MEL fallback is kept for robustness.
+    double startRaw = 1.0;
+    double endRaw = 100.0;
+    std::string source = "default(1-100)";
+
+    {
+        double minTime = MAnimControl::minTime().as(MTime::uiUnit());
+        double maxTime = MAnimControl::maxTime().as(MTime::uiUnit());
+        if (finitePair(minTime, maxTime)) {
+            startRaw = minTime;
+            endRaw = maxTime;
+            source = "MAnimControl(min/max)";
+        } else {
+            double melMin = 0.0;
+            double melMax = 0.0;
+            bool okMin = (MGlobal::executeCommand("playbackOptions -q -minTime", melMin) == MS::kSuccess);
+            bool okMax = (MGlobal::executeCommand("playbackOptions -q -maxTime", melMax) == MS::kSuccess);
+            if (okMin && okMax && finitePair(melMin, melMax)) {
+                startRaw = melMin;
+                endRaw = melMax;
+                source = "MEL(min/max)";
+            } else {
+                double animStart = 0.0;
+                double animEnd = 0.0;
+                bool okAnimStart = (MGlobal::executeCommand("playbackOptions -q -animationStartTime", animStart) == MS::kSuccess);
+                bool okAnimEnd = (MGlobal::executeCommand("playbackOptions -q -animationEndTime", animEnd) == MS::kSuccess);
+                if (okAnimStart && okAnimEnd && finitePair(animStart, animEnd)) {
+                    startRaw = animStart;
+                    endRaw = animEnd;
+                    source = "MEL(animationStart/End)";
+                }
+            }
+        }
     }
 
-    MString endResult;
-    MStatus endStat = MGlobal::executeCommand(
-        "playbackOptions -q -maxTime", endResult);
-    if (endStat == MStatus::kSuccess) {
-        endFrame = endResult.asInt();
+    if (endRaw < startRaw) std::swap(startRaw, endRaw);
+    int startFrame = roundFrame(startRaw);
+    int endFrame = roundFrame(endRaw);
+
+    {
+        std::ostringstream dbg;
+        dbg << "getFrameRange(timeline): source=" << source
+            << ", raw=" << startRaw << "-" << endRaw
+            << ", rounded=" << startFrame << "-" << endFrame;
+        PluginLog::info("BatchExporter", dbg.str());
     }
 
     return std::make_pair(startFrame, endFrame);

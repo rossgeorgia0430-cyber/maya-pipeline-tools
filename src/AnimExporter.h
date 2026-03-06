@@ -46,6 +46,7 @@ struct FrameRangeInfo {
     double firstKey;        // actual first keyframe
     double lastKey;         // actual last keyframe
     bool valid;             // whether query succeeded
+    bool inferredFromRange = false; // true when no explicit keys were found and export range is used
 };
 
 namespace AnimExporter {
