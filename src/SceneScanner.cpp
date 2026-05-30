@@ -125,6 +125,193 @@ static std::string getNamespace(const std::string& shortName) {
     return (prevColon != std::string::npos) ? ns.substr(prevColon + 1) : ns;
 }
 
+static std::string toLowerAscii(std::string value) {
+    for (auto& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+static std::vector<std::string> resolveLongNames(const std::string& node) {
+    std::vector<std::string> full = melQueryStringArray("ls -long \"" + node + "\"");
+    if (!full.empty()) return full;
+    return {node};
+}
+
+struct SkinClusterInfo {
+    std::string name;
+    std::set<std::string> influenceJoints;
+    std::set<std::string> meshTransforms;
+};
+
+struct CharacterCandidate {
+    std::string root;
+    std::string ns;
+    std::string display;
+    std::string bareRootLower;
+    std::vector<std::string> allJoints;
+    std::set<std::string> skinClusters;
+    std::set<std::string> meshTransforms;
+    int skinInfluenceHits = 0;
+    bool isBareRootNamedRoot = false;
+};
+
+static void collectMeshTransformsForGeometry(const std::string& geo,
+                                             std::set<std::string>& meshTransforms) {
+    std::vector<std::string> full = resolveLongNames(geo);
+    for (const auto& node : full) {
+        std::string geoType = melQueryString("nodeType \"" + node + "\"");
+
+        if (geoType == "mesh") {
+            std::vector<std::string> parent = melQueryStringArray(
+                "listRelatives -parent -fullPath \"" + node + "\"");
+            if (!parent.empty()) {
+                meshTransforms.insert(parent[0]);
+            }
+        } else if (geoType == "transform") {
+            std::vector<std::string> shapes = melQueryStringArray(
+                "listRelatives -children -type \"mesh\" -fullPath \"" + node + "\"");
+            if (!shapes.empty()) {
+                meshTransforms.insert(node);
+            }
+        }
+    }
+}
+
+static std::vector<SkinClusterInfo> collectSkinClusterInfos() {
+    std::vector<SkinClusterInfo> infos;
+    std::vector<std::string> skinClusters = melQueryStringArray("ls -type \"skinCluster\"");
+
+    for (const auto& skin : skinClusters) {
+        SkinClusterInfo info;
+        info.name = skin;
+
+        std::vector<std::string> influences = melQueryStringArray(
+            "skinCluster -q -inf \"" + skin + "\"");
+        for (const auto& influence : influences) {
+            std::vector<std::string> fullInfluences = resolveLongNames(influence);
+            for (const auto& full : fullInfluences) {
+                if (melQueryString("nodeType \"" + full + "\"") == "joint") {
+                    info.influenceJoints.insert(full);
+                }
+            }
+        }
+
+        std::vector<std::string> geometries = melQueryStringArray(
+            "skinCluster -q -g \"" + skin + "\"");
+        for (const auto& geo : geometries) {
+            collectMeshTransformsForGeometry(geo, info.meshTransforms);
+        }
+
+        infos.push_back(info);
+    }
+
+    return infos;
+}
+
+static CharacterCandidate analyzeCharacterCandidate(
+    const std::string& root,
+    const std::vector<SkinClusterInfo>& skinInfos) {
+    CharacterCandidate candidate;
+    candidate.root = root;
+    candidate.display = shortName(root);
+    candidate.ns = getNamespace(candidate.display);
+    candidate.bareRootLower = toLowerAscii(bareName(candidate.display));
+    candidate.isBareRootNamedRoot = (candidate.bareRootLower == "root");
+
+    std::vector<std::string> descendants = melQueryStringArray(
+        "listRelatives -allDescendents -type \"joint\" -fullPath \"" + root + "\"");
+    candidate.allJoints = descendants;
+    candidate.allJoints.push_back(root);
+
+    std::set<std::string> jointSet(candidate.allJoints.begin(), candidate.allJoints.end());
+
+    for (const auto& skin : skinInfos) {
+        int hits = 0;
+        for (const auto& influence : skin.influenceJoints) {
+            if (jointSet.count(influence) != 0) {
+                ++hits;
+            }
+        }
+
+        if (hits > 0) {
+            candidate.skinClusters.insert(skin.name);
+            candidate.skinInfluenceHits += hits;
+            candidate.meshTransforms.insert(skin.meshTransforms.begin(), skin.meshTransforms.end());
+        }
+    }
+
+    return candidate;
+}
+
+static int fallbackNamePriority(const CharacterCandidate& candidate) {
+    if (candidate.bareRootLower == "root") return 40;
+    if (candidate.bareRootLower == "bip001") return 30;
+    if (candidate.bareRootLower == "root_m") return 20;
+    if (candidate.bareRootLower.find("root") != std::string::npos) return 10;
+    return 0;
+}
+
+static bool hasSkinEvidence(const CharacterCandidate& candidate) {
+    return candidate.skinInfluenceHits > 0;
+}
+
+static bool isBetterCharacterCandidate(const CharacterCandidate& a,
+                                       const CharacterCandidate& b) {
+    const bool aHasSkin = hasSkinEvidence(a);
+    const bool bHasSkin = hasSkinEvidence(b);
+    if (aHasSkin != bHasSkin) return aHasSkin;
+
+    if (aHasSkin && bHasSkin) {
+        if (a.skinInfluenceHits != b.skinInfluenceHits) {
+            return a.skinInfluenceHits > b.skinInfluenceHits;
+        }
+        if (a.meshTransforms.size() != b.meshTransforms.size()) {
+            return a.meshTransforms.size() > b.meshTransforms.size();
+        }
+        if (a.skinClusters.size() != b.skinClusters.size()) {
+            return a.skinClusters.size() > b.skinClusters.size();
+        }
+        if (a.allJoints.size() != b.allJoints.size()) {
+            return a.allJoints.size() > b.allJoints.size();
+        }
+        int aName = fallbackNamePriority(a);
+        int bName = fallbackNamePriority(b);
+        if (aName != bName) return aName > bName;
+        return a.root < b.root;
+    }
+
+    // Preserve the old no-skin fallback behavior: a plain "Root" joint wins,
+    // then the largest hierarchy. This keeps control-only scenes predictable.
+    if (a.isBareRootNamedRoot != b.isBareRootNamedRoot) {
+        return a.isBareRootNamedRoot;
+    }
+    if (a.allJoints.size() != b.allJoints.size()) {
+        return a.allJoints.size() > b.allJoints.size();
+    }
+    int aName = fallbackNamePriority(a);
+    int bName = fallbackNamePriority(b);
+    if (aName != bName) return aName > bName;
+    return a.root < b.root;
+}
+
+static void logCharacterCandidate(const std::string& ns,
+                                  const CharacterCandidate& candidate,
+                                  bool selected) {
+    std::ostringstream dbg;
+    dbg << "findCharacters: candidate"
+        << (selected ? "[selected]" : "[rejected]")
+        << "{ns='" << ns
+        << "', root='" << candidate.root
+        << "', joints=" << candidate.allJoints.size()
+        << ", skinClusters=" << candidate.skinClusters.size()
+        << ", skinInfluenceHits=" << candidate.skinInfluenceHits
+        << ", meshes=" << candidate.meshTransforms.size()
+        << ", namePriority=" << fallbackNamePriority(candidate)
+        << "}";
+    PluginLog::info("SceneScanner", dbg.str());
+}
+
 // Helper: normalize path
 static std::string normPath(const std::string& path) {
     std::string p = path;
@@ -314,6 +501,7 @@ std::vector<CharacterInfo> findCharacters() {
 
     // Get all joints
     std::vector<std::string> allJoints = melQueryStringArray("ls -type \"joint\" -long");
+    std::vector<SkinClusterInfo> skinInfos = collectSkinClusterInfos();
 
     // Find root joints (no joint parent)
     std::vector<std::string> rootJoints;
@@ -337,38 +525,30 @@ std::vector<CharacterInfo> findCharacters() {
         const std::string& ns = kv.first;
         std::vector<std::string>& roots = kv.second;
 
-        // Pick the best root joint for export.
-        // Prefer a root whose bare name is "root" (case-insensitive) — this is the
-        // standard UE export skeleton in rigs that have multiple skeleton hierarchies
-        // (e.g. DeformationSystem/Root_M, FitSkeleton/Root1, and the export skeleton "root").
-        // Fall back to the root with the most descendants if none is named "root".
-        std::string bestRoot = roots[0];
-        int bestCount = 0;
-        bool bestIsRootNamed = false;
+        // Pick the export skeleton by binding evidence first.
+        // ADV/Max-Bip rigs often contain FitSkeleton/control roots in the same
+        // namespace; the real export skeleton is the root whose descendants are
+        // used by skinCluster influences.
+        std::vector<CharacterCandidate> candidates;
+        candidates.reserve(roots.size());
+        for (const auto& root : roots) {
+            candidates.push_back(analyzeCharacterCandidate(root, skinInfos));
+        }
 
-        for (const auto& r : roots) {
-            std::string sn_r = shortName(r);
-            std::string bn = bareName(sn_r);
-            std::string lower = bn;
-            for (auto& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-            bool isRootNamed = (lower == "root");
-
-            std::string cmd = "listRelatives -allDescendents -type \"joint\" \"" + r + "\"";
-            std::vector<std::string> desc = melQueryStringArray(cmd);
-            int count = (int)desc.size();
-
-            // Prefer "root"-named joint; among same priority, prefer most descendants
-            if ((isRootNamed && !bestIsRootNamed) ||
-                (isRootNamed == bestIsRootNamed && count > bestCount)) {
-                bestCount = count;
-                bestRoot = r;
-                bestIsRootNamed = isRootNamed;
+        CharacterCandidate best = candidates[0];
+        for (size_t i = 1; i < candidates.size(); ++i) {
+            if (isBetterCharacterCandidate(candidates[i], best)) {
+                best = candidates[i];
             }
         }
 
-        std::string sn = shortName(bestRoot);
+        for (const auto& candidate : candidates) {
+            logCharacterCandidate(ns, candidate, candidate.root == best.root);
+        }
+
+        std::string sn = shortName(best.root);
         CharacterInfo info;
-        info.rootJoint = bestRoot;
+        info.rootJoint = best.root;
 
         if (!ns.empty()) {
             info.nsOrName = ns;
@@ -448,54 +628,23 @@ std::vector<SkeletonBlendShapeInfo> findSkeletonBlendShapeCombos() {
     std::vector<SkeletonBlendShapeInfo> result;
 
     std::vector<CharacterInfo> characters = findCharacters();
+    std::vector<SkinClusterInfo> skinInfos = collectSkinClusterInfos();
 
     PluginLog::info("SceneScanner",
         "findSkeletonBlendShapeCombos: scanning " + std::to_string(characters.size()) + " characters for BS deformers");
 
     for (const auto& ch : characters) {
-        // Collect all joints under this character
-        std::string listCmd = "listRelatives -allDescendents -type \"joint\" -fullPath \"" + ch.rootJoint + "\"";
-        std::vector<std::string> allJoints = melQueryStringArray(listCmd);
-        allJoints.push_back(ch.rootJoint);
-
-        // Find skinClusters connected to these joints
-        std::set<std::string> skinClusters;
-        for (const auto& j : allJoints) {
-            std::vector<std::string> clusters = melQueryStringArray(
-                "listConnections -source true -destination false -type \"skinCluster\" \"" + j + "\"");
-            if (clusters.empty()) {
-                clusters = melQueryStringArray(
-                    "listConnections -source true -destination true -type \"skinCluster\" \"" + j + "\"");
-            }
-            skinClusters.insert(clusters.begin(), clusters.end());
-        }
-
-        // For each skinCluster, get the output mesh transforms
-        std::set<std::string> skinnedMeshTransforms;
-        for (const auto& skin : skinClusters) {
-            std::vector<std::string> geos = melQueryStringArray("skinCluster -q -g \"" + skin + "\"");
-            for (const auto& g : geos) {
-                std::vector<std::string> full = melQueryStringArray("ls -long \"" + g + "\"");
-                std::string geo = full.empty() ? g : full[0];
-                std::string geoType = melQueryString("nodeType \"" + geo + "\"");
-
-                if (geoType == "mesh") {
-                    std::vector<std::string> parent = melQueryStringArray(
-                        "listRelatives -parent -fullPath \"" + geo + "\"");
-                    if (!parent.empty()) {
-                        skinnedMeshTransforms.insert(parent[0]);
-                    }
-                } else if (geoType == "transform") {
-                    skinnedMeshTransforms.insert(geo);
-                }
-            }
-        }
+        CharacterCandidate evidence = analyzeCharacterCandidate(ch.rootJoint, skinInfos);
+        std::vector<std::string> allJoints = evidence.allJoints;
+        std::set<std::string> skinClusters = evidence.skinClusters;
+        std::set<std::string> skinnedMeshTransforms = evidence.meshTransforms;
 
         {
             std::ostringstream dbg;
             dbg << "  character '" << ch.display << "': "
                 << skinClusters.size() << " skinClusters, "
-                << skinnedMeshTransforms.size() << " skinned meshes";
+                << skinnedMeshTransforms.size() << " skinned meshes, "
+                << evidence.skinInfluenceHits << " skin influence hits";
             PluginLog::info("SceneScanner", dbg.str());
         }
 

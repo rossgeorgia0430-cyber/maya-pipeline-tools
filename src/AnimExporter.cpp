@@ -484,6 +484,13 @@ static std::vector<std::string> collectSkinnedMeshTransformsForJoints(const std:
     std::set<std::string> skinClusters;
     std::set<std::string> meshShapes;
     std::set<std::string> meshTransforms;
+    std::set<std::string> jointSet(joints.begin(), joints.end());
+
+    auto resolveLongNames = [](const std::string& node) {
+        std::vector<std::string> full = melQueryStringArray("ls -long \"" + node + "\"");
+        if (!full.empty()) return full;
+        return std::vector<std::string>{node};
+    };
 
     for (const auto& j : joints) {
         std::vector<std::string> clusters = melQueryStringArray(
@@ -498,26 +505,53 @@ static std::vector<std::string> collectSkinnedMeshTransformsForJoints(const std:
         skinClusters.insert(clusters.begin(), clusters.end());
     }
 
+    // Robust fallback for ADV/Max-Bip style rigs: the skinCluster may not be
+    // discoverable from the chosen root by simple listConnections, while its
+    // influence list still points at descendant joints under that root.
+    std::vector<std::string> allSkinClusters = melQueryStringArray("ls -type \"skinCluster\"");
+    for (const auto& skin : allSkinClusters) {
+        if (skinClusters.count(skin) != 0) continue;
+
+        std::vector<std::string> influences = melQueryStringArray(
+            "skinCluster -q -inf \"" + skin + "\"");
+        bool matched = false;
+        for (const auto& influence : influences) {
+            std::vector<std::string> fullInfluences = resolveLongNames(influence);
+            for (const auto& full : fullInfluences) {
+                if (jointSet.count(full) != 0) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) break;
+        }
+
+        if (matched) {
+            skinClusters.insert(skin);
+        }
+    }
+
     for (const auto& skin : skinClusters) {
         std::vector<std::string> geos = melQueryStringArray("skinCluster -q -g \"" + skin + "\"");
         for (const auto& g : geos) {
-            std::vector<std::string> full = melQueryStringArray("ls -long \"" + g + "\"");
-            std::string geo = full.empty() ? g : full[0];
-            std::string geoType = melQueryString("nodeType \"" + geo + "\"");
+            std::vector<std::string> full = resolveLongNames(g);
+            for (const auto& geo : full) {
+                std::string geoType = melQueryString("nodeType \"" + geo + "\"");
 
-            if (geoType == "mesh") {
-                meshShapes.insert(geo);
-                std::vector<std::string> parent = melQueryStringArray(
-                    "listRelatives -parent -fullPath \"" + geo + "\"");
-                if (!parent.empty()) {
-                    meshTransforms.insert(parent[0]);
-                }
-            } else if (geoType == "transform") {
-                std::vector<std::string> shapes = melQueryStringArray(
-                    "listRelatives -children -type \"mesh\" -fullPath \"" + geo + "\"");
-                if (!shapes.empty()) {
-                    meshShapes.insert(shapes.begin(), shapes.end());
-                    meshTransforms.insert(geo);
+                if (geoType == "mesh") {
+                    meshShapes.insert(geo);
+                    std::vector<std::string> parent = melQueryStringArray(
+                        "listRelatives -parent -fullPath \"" + geo + "\"");
+                    if (!parent.empty()) {
+                        meshTransforms.insert(parent[0]);
+                    }
+                } else if (geoType == "transform") {
+                    std::vector<std::string> shapes = melQueryStringArray(
+                        "listRelatives -children -type \"mesh\" -fullPath \"" + geo + "\"");
+                    if (!shapes.empty()) {
+                        meshShapes.insert(shapes.begin(), shapes.end());
+                        meshTransforms.insert(geo);
+                    }
                 }
             }
         }
